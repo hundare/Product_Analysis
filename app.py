@@ -1,4 +1,6 @@
 import os
+import json
+import asyncio
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -6,9 +8,11 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from mcp.server import Server
+from mcp.types import Tool, TextContent
 
-app = FastAPI(title="Web Search MCP", version="1.0.0")
 
+# ==================== Models ====================
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -21,15 +25,26 @@ class SearchResult(BaseModel):
     snippet: str
 
 
-class MCPRequest(BaseModel):
-    tool: str | None = None
-    method: str | None = None
-    arguments: dict[str, Any] | None = None
+class SearchResultObj:
+    """Internal result object for consistency"""
+
+    def __init__(self, title: str, url: str, snippet: str):
+        self.title = title
+        self.url = url
+        self.snippet = snippet
+
+    def to_dict(self) -> dict[str, str]:
+        return {"title": self.title, "url": self.url, "snippet": self.snippet}
+
+    def to_model(self) -> SearchResult:
+        return SearchResult(title=self.title, url=self.url, snippet=self.snippet)
 
 
-def parse_duckduckgo_html(html: str, limit: int) -> list[SearchResult]:
+# ==================== Search Logic ====================
+
+def parse_duckduckgo_html(html: str, limit: int) -> list[SearchResultObj]:
     soup = BeautifulSoup(html, "html.parser")
-    results: list[SearchResult] = []
+    results: list[SearchResultObj] = []
 
     for a in soup.select("a.result__a")[:limit]:
         title = a.get_text(" ", strip=True)
@@ -43,7 +58,9 @@ def parse_duckduckgo_html(html: str, limit: int) -> list[SearchResult]:
                 snippet = snippet_tag.get_text(" ", strip=True)
 
         if href:
-            results.append(SearchResult(title=title, url=decode_duckduckgo_url(href), snippet=snippet))
+            results.append(
+                SearchResultObj(title=title, url=decode_duckduckgo_url(href), snippet=snippet)
+            )
 
     return results
 
@@ -61,81 +78,129 @@ def decode_duckduckgo_url(href: str) -> str:
     return href
 
 
-def search_brave(query: str, limit: int) -> list[SearchResult]:
+def search_brave(query: str, limit: int) -> list[SearchResultObj]:
     api_key = os.getenv("BRAVE_API_KEY")
     if not api_key:
         return []
 
-    response = httpx.get(
-        "https://api.search.brave.com/res/v1/web/search",
-        headers={"X-Search-Api-Key": api_key},
-        params={"q": query, "count": limit},
-        timeout=15.0,
-    )
-    response.raise_for_status()
-    payload = response.json()
-
-    results: list[SearchResult] = []
-    for item in payload.get("web", {}).get("results", [])[:limit]:
-        results.append(
-            SearchResult(
-                title=item.get("title", ""),
-                url=item.get("url", ""),
-                snippet=item.get("description", ""),
-            )
+    try:
+        response = httpx.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"X-Search-Api-Key": api_key},
+            params={"q": query, "count": limit},
+            timeout=15.0,
         )
+        response.raise_for_status()
+        payload = response.json()
 
-    return results
+        results: list[SearchResultObj] = []
+        for item in payload.get("web", {}).get("results", [])[:limit]:
+            results.append(
+                SearchResultObj(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    snippet=item.get("description", ""),
+                )
+            )
+        return results
+    except Exception:
+        return []
 
 
-def search_web(query: str, limit: int) -> list[SearchResult]:
+def search_web(query: str, limit: int) -> list[SearchResultObj]:
     brave_results = search_brave(query, limit)
     if brave_results:
         return brave_results
 
-    response = httpx.get(
-        "https://html.duckduckgo.com/html/",
-        params={"q": query},
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=15.0,
-    )
-    response.raise_for_status()
-    return parse_duckduckgo_html(response.text, limit)
+    try:
+        response = httpx.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        return parse_duckduckgo_html(response.text, limit)
+    except httpx.HTTPError:
+        return []
+
+
+# ==================== FastAPI HTTP Endpoints ====================
+
+app = FastAPI(title="Web Search MCP", version="1.0.0")
 
 
 @app.get("/")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "web-search-mcp", "mode": "http"}
+    return {"status": "ok", "service": "web-search-mcp", "mode": "http+mcp"}
 
 
 @app.post("/search", response_model=list[SearchResult])
 def search_endpoint(req: SearchRequest) -> list[SearchResult]:
     try:
-        return search_web(req.query, req.limit)
+        results = search_web(req.query, req.limit)
+        return [r.to_model() for r in results]
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"search provider error: {exc}") from exc
 
 
-@app.post("/mcp")
-def mcp_endpoint(req: MCPRequest) -> dict[str, Any]:
-    tool_name = req.tool or req.method or "web_search"
-    if tool_name != "web_search":
-        raise HTTPException(status_code=404, detail="unsupported tool")
+# ==================== MCP Server ====================
 
-    args = req.arguments or {}
-    query = str(args.get("query", "")).strip()
+server = Server("web-search-mcp")
+
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="web_search",
+            description="Search the web for information. Returns top results with title, URL, and snippet.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of results to return (1-10)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        )
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    if name != "web_search":
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+    query = arguments.get("query", "").strip()
     if not query:
-        raise HTTPException(status_code=400, detail="query is required")
+        return [TextContent(type="text", text="Error: query is required")]
 
-    limit = int(args.get("limit", 5))
-    return {
-        "ok": True,
-        "tool": tool_name,
-        "results": search_web(query, limit),
-    }
+    limit = min(int(arguments.get("limit", 5)), 10)
 
+    try:
+        results = search_web(query, limit)
+        if not results:
+            return [TextContent(type="text", text="No results found")]
+
+        results_json = json.dumps([r.to_dict() for r in results], indent=2)
+        return [TextContent(type="text", text=results_json)]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Search error: {str(e)}")]
+
+
+# ==================== Entry Points ====================
 
 if __name__ == "__main__":
     import uvicorn
 
+    # Start FastAPI server on HTTP port
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+

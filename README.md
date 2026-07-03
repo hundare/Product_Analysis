@@ -1,45 +1,124 @@
-# Web Search MCP Service
+# Web Search MCP Server
 
-This project exposes a simple web search endpoint that can be deployed on Render and called from a low-code app.
+A proper **Model Context Protocol (MCP)** server that exposes a web search tool. This allows Claude, Cursor, and other MCP-compatible clients to call web search as a native tool.
+
+## Features
+
+- **Standard MCP Protocol**: Fully compatible with Claude, Cursor IDE, and other MCP clients
+- **Web Search Tool**: Search the web using DuckDuckGo or Brave API (if configured)
+- **No HTTP overhead**: Communicates via efficient stdio transport
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Run locally
 
 ```bash
-python -m pip install -r requirements.txt
-python app.py
+python mcp_server.py
 ```
 
-Then open:
+The server runs on stdio (standard input/output), which is the MCP standard.
 
-- http://127.0.0.1:8000/ -> health check
-- http://127.0.0.1:8000/search -> POST JSON search endpoint
+## Use with Cursor
 
-Example request:
-
-```bash
-curl -X POST http://127.0.0.1:8000/search \
-  -H "Content-Type: application/json" \
-  -d '{"query":"python mcp server","limit":3}'
-```
-
-## Deploy to Render
-
-1. Push this folder to GitHub.
-2. Create a new Web Service on Render.
-3. Connect the repository.
-4. Use these settings:
-   - Build Command: `pip install -r requirements.txt`
-   - Start Command: `python app.py`
-5. Render will provide a public URL such as:
-   `https://your-service-name.onrender.com`
-
-## Low-code app usage
-
-Call the Render URL with a POST request to `/search`:
+1. Add this to your `.cursor/rules` or Cursor settings:
 
 ```json
 {
-  "query": "latest AI news",
-  "limit": 5
+  "tools": [
+    {
+      "name": "web-search-mcp",
+      "type": "mcp",
+      "command": "python /path/to/mcp_server.py"
+    }
+  ]
 }
 ```
+
+2. Cursor will now have access to the `web_search` tool.
+
+## Use with Claude Desktop
+
+1. Add to `~/.claude/config.json`:
+
+```json
+{
+  "tools": {
+    "web_search": {
+      "type": "stdio",
+      "command": "python /path/to/mcp_server.py"
+    }
+  }
+}
+```
+
+## Tool specification
+
+### web_search
+
+**Description**: Search the web for information.
+
+**Parameters**:
+- `query` (string, required): Search query
+- `limit` (integer, optional): Number of results to return (1-10, default: 5)
+
+**Returns**: JSON array of results with `title`, `url`, and `snippet`.
+
+Example result:
+
+```json
+[
+  {
+    "title": "Python MCP Server Guide",
+    "url": "https://example.com/mcp-guide",
+    "snippet": "Learn how to build MCP servers in Python..."
+  }
+]
+```
+
+## Optional: Brave Search API
+
+To use the Brave Search API (better results, requires API key):
+
+```bash
+export BRAVE_API_KEY=your_api_key_here
+python mcp_server.py
+```
+
+If no API key is set, the server falls back to DuckDuckGo.
+
+## Deploy to Render
+
+1. Push to GitHub.
+2. Create a Web Service on Render.
+3. Connect the repo.
+4. Keep the default settings:
+   - Build Command: `pip install -r requirements.txt`
+   - Start Command: `python mcp_server.py`
+
+## Architecture
+
+```
+┌─────────────────────────┐
+│  Cursor / Claude        │
+│  (MCP Client)           │
+└────────────┬────────────┘
+             │ (stdio)
+             │
+┌────────────▼────────────┐
+│   MCP Server            │
+│  - Defines web_search   │
+│  - Handles tool calls   │
+└────────────┬────────────┘
+             │
+             │ (httpx)
+             │
+┌────────────▼────────────┐
+│  DuckDuckGo / Brave     │
+│  Search APIs            │
+└─────────────────────────┘
+```
+
