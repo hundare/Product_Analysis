@@ -14,9 +14,18 @@ from mcp.types import Tool, TextContent
 
 # ==================== Models ====================
 
+# ISO 3166-1 alpha-2 country codes supported by Brave Search
+BRAVE_COUNTRY_CODES = {
+    "USA": "us", "UK": "gb", "CANADA": "ca", "AUSTRALIA": "au",
+    "GERMANY": "de", "FRANCE": "fr", "INDIA": "in", "JAPAN": "jp",
+    "BRAZIL": "br", "MEXICO": "mx", "SPAIN": "es", "ITALY": "it",
+}
+
+
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     limit: int = Field(5, ge=1, le=10)
+    country: str | None = Field(None, description="Country for geo-targeted results (e.g. USA, UK, INDIA)")
 
 
 class SearchResult(BaseModel):
@@ -78,16 +87,22 @@ def decode_duckduckgo_url(href: str) -> str:
     return href
 
 
-def search_brave(query: str, limit: int) -> list[SearchResultObj]:
+def search_brave(query: str, limit: int, country: str | None = None) -> list[SearchResultObj]:
     api_key = os.getenv("BRAVE_API_KEY")
     if not api_key:
         return []
+
+    params: dict[str, Any] = {"q": query, "count": limit}
+    if country:
+        country_code = BRAVE_COUNTRY_CODES.get(country.upper())
+        if country_code:
+            params["country"] = country_code
 
     try:
         response = httpx.get(
             "https://api.search.brave.com/res/v1/web/search",
             headers={"X-Search-Api-Key": api_key},
-            params={"q": query, "count": limit},
+            params=params,
             timeout=15.0,
         )
         response.raise_for_status()
@@ -107,15 +122,17 @@ def search_brave(query: str, limit: int) -> list[SearchResultObj]:
         return []
 
 
-def search_web(query: str, limit: int) -> list[SearchResultObj]:
-    brave_results = search_brave(query, limit)
+def search_web(query: str, limit: int, country: str | None = None) -> list[SearchResultObj]:
+    brave_results = search_brave(query, limit, country)
     if brave_results:
         return brave_results
 
+    # DuckDuckGo fallback: append country to query string since HTML endpoint has no geo param
+    ddg_query = f"{query} site:.{BRAVE_COUNTRY_CODES.get(country.upper(), '')}" if country and BRAVE_COUNTRY_CODES.get((country or "").upper()) else query
     try:
         response = httpx.get(
             "https://html.duckduckgo.com/html/",
-            params={"q": query},
+            params={"q": ddg_query},
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=15.0,
         )
@@ -138,7 +155,7 @@ def health() -> dict[str, Any]:
 @app.post("/search", response_model=list[SearchResult])
 def search_endpoint(req: SearchRequest) -> list[SearchResult]:
     try:
-        results = search_web(req.query, req.limit)
+        results = search_web(req.query, req.limit, req.country)
         return [r.to_model() for r in results]
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"search provider error: {exc}") from exc
@@ -167,6 +184,10 @@ async def list_tools() -> list[Tool]:
                         "description": "Number of results to return (1-10)",
                         "default": 5,
                     },
+                    "country": {
+                        "type": "string",
+                        "description": "Country for geo-targeted results (e.g. USA, UK, INDIA, GERMANY)",
+                    },
                 },
                 "required": ["query"],
             },
@@ -184,9 +205,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text="Error: query is required")]
 
     limit = min(int(arguments.get("limit", 5)), 10)
+    country: str | None = arguments.get("country")
 
     try:
-        results = search_web(query, limit)
+        results = search_web(query, limit, country)
         if not results:
             return [TextContent(type="text", text="No results found")]
 
