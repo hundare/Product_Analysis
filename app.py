@@ -6,19 +6,23 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
+load_dotenv()
+
 
 # ==================== Models ====================
 
-# ISO 3166-1 alpha-2 country codes supported by Brave Search
-BRAVE_COUNTRY_CODES = {
-    "USA": "us", "UK": "gb", "CANADA": "ca", "AUSTRALIA": "au",
-    "GERMANY": "de", "FRANCE": "fr", "INDIA": "in", "JAPAN": "jp",
-    "BRAZIL": "br", "MEXICO": "mx", "SPAIN": "es", "ITALY": "it",
+# Country names used for geo-targeting via Tavily query context
+COUNTRY_NAMES = {
+    "USA": "United States", "UK": "United Kingdom", "CANADA": "Canada",
+    "AUSTRALIA": "Australia", "GERMANY": "Germany", "FRANCE": "France",
+    "INDIA": "India", "JAPAN": "Japan", "BRAZIL": "Brazil",
+    "MEXICO": "Mexico", "SPAIN": "Spain", "ITALY": "Italy",
 }
 
 
@@ -51,95 +55,101 @@ class SearchResultObj:
 
 # ==================== Search Logic ====================
 
+
 def parse_duckduckgo_html(html: str, limit: int) -> list[SearchResultObj]:
     soup = BeautifulSoup(html, "html.parser")
     results: list[SearchResultObj] = []
-
     for a in soup.select("a.result__a")[:limit]:
         title = a.get_text(" ", strip=True)
         href = a.get("href", "")
         snippet = ""
-
         parent = a.find_parent("div", class_="result__body")
         if parent:
             snippet_tag = parent.select_one(".result__snippet")
             if snippet_tag:
                 snippet = snippet_tag.get_text(" ", strip=True)
-
         if href:
-            results.append(
-                SearchResultObj(title=title, url=decode_duckduckgo_url(href), snippet=snippet)
-            )
-
+            parsed = urlparse(href)
+            if parsed.scheme not in {"http", "https"} and "uddg=" in href:
+                values = parse_qs(parsed.query)
+                href = values["uddg"][0] if "uddg" in values and values["uddg"] else href
+            results.append(SearchResultObj(title=title, url=href, snippet=snippet))
     return results
 
 
-def decode_duckduckgo_url(href: str) -> str:
-    parsed = urlparse(href)
-    if parsed.scheme in {"http", "https"}:
-        return href
-
-    if "uddg=" in href:
-        values = parse_qs(parsed.query)
-        if "uddg" in values and values["uddg"]:
-            return values["uddg"][0]
-
-    return href
-
-
-def search_brave(query: str, limit: int, country: str | None = None) -> list[SearchResultObj]:
-    api_key = os.getenv("BRAVE_API_KEY")
+def search_tavily(query: str, limit: int, country: str | None = None) -> list[SearchResultObj]:
+    api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        return []
+        raise EnvironmentError("TAVILY_API_KEY environment variable is not set")
 
-    params: dict[str, Any] = {"q": query, "count": limit}
+    # Append country context to query for geo-targeted results
     if country:
-        country_code = BRAVE_COUNTRY_CODES.get(country.upper())
-        if country_code:
-            params["country"] = country_code
+        country_name = COUNTRY_NAMES.get(country.upper())
+        if country_name:
+            query = f"{query} in {country_name}"
 
-    try:
-        response = httpx.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"X-Search-Api-Key": api_key},
-            params=params,
-            timeout=15.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
+    payload: dict[str, Any] = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": limit,
+        "search_depth": "advanced",
+        "include_answer": False,
+        "include_raw_content": False,
+    }
 
-        results: list[SearchResultObj] = []
-        for item in payload.get("web", {}).get("results", [])[:limit]:
-            results.append(
-                SearchResultObj(
-                    title=item.get("title", ""),
-                    url=item.get("url", ""),
-                    snippet=item.get("description", ""),
-                )
+    response = httpx.post(
+        "https://api.tavily.com/search",
+        json=payload,
+        timeout=20.0,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    results: list[SearchResultObj] = []
+    for item in data.get("results", [])[:limit]:
+        results.append(
+            SearchResultObj(
+                title=item.get("title", ""),
+                url=item.get("url", ""),
+                snippet=item.get("content", ""),
             )
-        return results
-    except Exception:
-        return []
+        )
+    return results
 
 
 def search_web(query: str, limit: int, country: str | None = None) -> list[SearchResultObj]:
-    brave_results = search_brave(query, limit, country)
-    if brave_results:
-        return brave_results
+    tavily_error: str | None = None
 
-    # DuckDuckGo fallback: append country to query string since HTML endpoint has no geo param
-    ddg_query = f"{query} site:.{BRAVE_COUNTRY_CODES.get(country.upper(), '')}" if country and BRAVE_COUNTRY_CODES.get((country or "").upper()) else query
+    try:
+        results = search_tavily(query, limit, country)
+        if results:
+            return results
+    except Exception as e:
+        tavily_error = str(e)
+
+    # DuckDuckGo fallback
+    country_name = COUNTRY_NAMES.get((country or "").upper(), "")
+    ddg_query = f"{query} in {country_name}" if country_name else query
     try:
         response = httpx.get(
             "https://html.duckduckgo.com/html/",
             params={"q": ddg_query},
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
             timeout=15.0,
         )
         response.raise_for_status()
-        return parse_duckduckgo_html(response.text, limit)
-    except httpx.HTTPError:
-        return []
+        ddg_results = parse_duckduckgo_html(response.text, limit)
+        if ddg_results:
+            return ddg_results
+    except Exception:
+        pass
+
+    detail = f"Tavily: {tavily_error}. DuckDuckGo: returned no results (may be blocked by cloud IP)." if tavily_error else "DuckDuckGo returned no results (may be blocked by cloud IP)."
+    raise RuntimeError(detail)
 
 
 # ==================== FastAPI HTTP Endpoints ====================
@@ -149,7 +159,12 @@ app = FastAPI(title="Web Search MCP", version="1.0.0")
 
 @app.get("/")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "web-search-mcp", "mode": "http+mcp"}
+    return {
+        "status": "ok",
+        "service": "web-search-mcp",
+        "mode": "http+mcp",
+        "tavily_api_key_set": bool(os.getenv("TAVILY_API_KEY")),
+    }
 
 
 @app.post("/search", response_model=list[SearchResult])
@@ -157,6 +172,8 @@ def search_endpoint(req: SearchRequest) -> list[SearchResult]:
     try:
         results = search_web(req.query, req.limit, req.country)
         return [r.to_model() for r in results]
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"search provider error: {exc}") from exc
 
